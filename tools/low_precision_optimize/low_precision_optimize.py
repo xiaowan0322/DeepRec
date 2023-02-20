@@ -435,6 +435,7 @@ def embedding_opt(session, graph_def, opt_config, data_type, variable_path):
             tmp_path = tempfile.mkdtemp(dir='.')
             opt_path = f'{tmp_path}/variables'
             dtype = get_tf_dtype(opt_dtype)
+            import re; names = [k[:k.rfind('/')] if re.search('/part_[0-9]+$', k) else k for k in names]
             quantize_embedding_variable.quantize_by_name(
                 variable_path, opt_path, names, quant_names, scale_names, dtype, False
             )
