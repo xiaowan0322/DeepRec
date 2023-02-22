@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import tempfile
 
@@ -180,9 +181,10 @@ def remove_redundant_casts(session, graph_def):
             update_op_inputs(session.graph, {ptm['cast2src']: cast2dst_op.inputs[0]})
 
 
-def dense_opt(session, graph_def, opt_config, data_type, calib_file):
+def dense_opt(session, graph_def, opt_config, skip_list, data_type, calib_file):
     simple_graph = SimpleGraph(graph_def)
     update_dict = dict()
+    init_list = list()
     calib_data = None
     if calib_file:
         calib_data = np.load(calib_file, allow_pickle=True, encoding='bytes')
@@ -227,6 +229,8 @@ def dense_opt(session, graph_def, opt_config, data_type, calib_file):
         ptm_list = [ptm for ptm in ptm_list if ptm['matmul'] not in update_dict]
         if opt_config:
             ptm_list = [ptm for ptm in ptm_list if ptm['matmul'] in opt_config]
+        if skip_list:
+            ptm_list = [ptm for ptm in ptm_list if ptm['matmul'] not in skip_list]
         for ptm in ptm_list:
             if ptm['matmul'] in update_dict:
                 continue
@@ -243,28 +247,30 @@ def dense_opt(session, graph_def, opt_config, data_type, calib_file):
             dense_op = session.graph.get_operation_by_name(node.name)
             if opt_dtype in [BF16, FP16]:
                 tf_dtype = tf.bfloat16 if opt_dtype == BF16 else tf.float16
-                w_f16_ts = tf.constant(
-                    value=tf.cast(w_data, tf_dtype).eval(),
-                    dtype=tf_dtype,
+                w_f16_var = tf.get_variable(
                     name=f'{pref}/{opt_dtype.lower()}_weight',
+                    shape=w_data.shape,
+                    dtype=tf_dtype,
                 )
+                init_list.append(w_f16_var.assign(tf.cast(w_data, tf_dtype)))
                 in_f16_ts = tf.cast(
                     dense_op.inputs[0], tf_dtype, name=f'{pref}/{opt_dtype.lower()}'
                 )
                 out_f16_ts = tf.matmul(
                     a=in_f16_ts,
-                    b=w_f16_ts,
+                    b=w_f16_var,
                     transpose_a=dense_op.get_attr('transpose_a'),
                     transpose_b=dense_op.get_attr('transpose_b'),
                     name=f'{pref}/{opt_dtype.lower()}_matmul',
                 )
                 if with_bias:
-                    bias_f16_ts = tf.constant(
-                        value=tf.cast(bias_data, tf_dtype).eval(),
-                        dtype=tf_dtype,
+                    bias_f16_var = tf.get_variable(
                         name=f'{pref}/{opt_dtype.lower()}_bias',
+                        shape=bias_data.shape,
+                        dtype=tf_dtype,
                     )
-                    out_f16_ts = tf.nn.bias_add(out_f16_ts, bias_f16_ts)
+                    init_list.append(bias_f16_var.assign(tf.cast(bias_data, tf_dtype)))
+                    out_f16_ts = tf.nn.bias_add(out_f16_ts, bias_f16_var)
                 out_f16_ts = tf.nn.relu(out_f16_ts) if with_relu else out_f16_ts
                 out_fp32_ts = tf.cast(out_f16_ts, tf.float32, name=f'{pref}/fp32')
                 update_op_inputs(session.graph, {ptm[first_key]: out_fp32_ts})
@@ -276,17 +282,21 @@ def dense_opt(session, graph_def, opt_config, data_type, calib_file):
             w_max_abs_val = np.max(np.abs(w_data))
             w_scale = np.array(w_max_abs_val / 127.0)
             w_int8_data = np.int8(np.round(w_data / w_scale))
-            w_min_ts = tf.constant(-1 * w_max_abs_val, tf.float32, name=f'{pref}/w_min')
-            w_max_ts = tf.constant(w_max_abs_val, tf.float32, name=f'{pref}/w_max')
+            w_min_var = tf.get_variable(f'{pref}/w_min', shape=[], dtype=tf.float32)
+            w_max_var = tf.get_variable(f'{pref}/w_max', shape=[], dtype=tf.float32)
             w_int8_ts = tf.constant(w_int8_data, tf.qint8, name=f'{pref}/int8_weight')
+            init_list.append(w_min_var.assign(-1 * w_max_abs_val))
+            init_list.append(w_max_var.assign(w_max_abs_val))
             # Update input
             in_min_val, in_max_val = _calibrate(_ts(node.input[0]))
-            in_min_ts = tf.constant(in_min_val, tf.float32, name=f'{pref}/in_min')
-            in_max_ts = tf.constant(in_max_val, tf.float32, name=f'{pref}/in_max')
+            in_min_var = tf.get_variable(f'{pref}/in_min', shape=[], dtype=tf.float32)
+            in_max_var = tf.get_variable(f'{pref}/in_max', shape=[], dtype=tf.float32)
+            init_list.append(in_min_var.assign(in_min_val))
+            init_list.append(in_max_var.assign(in_max_val))
             in_int8_ts, _, _ = tf.raw_ops.QuantizeV2(
                 input=dense_op.inputs[0],
-                min_range=in_min_ts,
-                max_range=in_max_ts,
+                min_range=in_min_var,
+                max_range=in_max_var,
                 T=tf.quint8,
                 mode='MIN_FIRST',
                 name=f'{pref}/int8_input',
@@ -294,8 +304,10 @@ def dense_opt(session, graph_def, opt_config, data_type, calib_file):
             # Add requantize scale
             out_min_val, out_max_val = _calibrate(_ts(ptm[first_key]))
             req_min_val, req_max_val = 0.0, (out_max_val - out_min_val) * 256.0 / 255.0
-            req_min_ts = tf.constant(req_min_val, tf.float32, name=f'{pref}/req_min')
-            req_max_ts = tf.constant(req_max_val, tf.float32, name=f'{pref}/req_max')
+            req_min_var = tf.get_variable(f'{pref}/req_min', shape=[], dtype=tf.float32)
+            req_max_var = tf.get_variable(f'{pref}/req_max', shape=[], dtype=tf.float32)
+            init_list.append(req_min_var.assign(req_min_val))
+            init_list.append(req_max_var.assign(req_max_val))
             # Update bias
             in_scale = (in_max_val - in_min_val) / 255.0
             in_zero_point = -1.0 * round(in_min_val / in_scale)
@@ -318,23 +330,25 @@ def dense_opt(session, graph_def, opt_config, data_type, calib_file):
                 a=in_int8_ts,
                 b=w_int8_ts,
                 bias=bias_int_ts,
-                min_a=in_min_ts,
-                max_a=in_max_ts,
-                min_b=w_min_ts,
-                max_b=w_max_ts,
-                min_freezed_output=req_min_ts,
-                max_freezed_output=req_max_ts,
+                min_a=in_min_var,
+                max_a=in_max_var,
+                min_b=w_min_var,
+                max_b=w_max_var,
+                min_freezed_output=req_min_var,
+                max_freezed_output=req_max_var,
                 Toutput=tf.quint8,
                 input_quant_mode='MIN_FIRST',
                 name=f'{pref}/int8_matmul',
             )
             # Add dequantize
-            out_min_ts = tf.constant(out_min_val, tf.float32, name=f'{pref}/out_min')
-            out_max_ts = tf.constant(out_max_val, tf.float32, name=f'{pref}/out_max')
+            out_min_var = tf.get_variable(f'{pref}/out_min', shape=[], dtype=tf.float32)
+            out_max_var = tf.get_variable(f'{pref}/out_max', shape=[], dtype=tf.float32)
+            init_list.append(out_min_var.assign(out_min_val))
+            init_list.append(out_max_var.assign(out_max_val))
             out_fp32_ts = tf.raw_ops.Dequantize(
                 input=matmul_int8_ts,
-                min_range=out_min_ts,
-                max_range=out_max_ts,
+                min_range=out_min_var,
+                max_range=out_max_var,
                 mode='MIN_FIRST',
                 name=f'{pref}/dequantize',
             )
@@ -346,6 +360,7 @@ def dense_opt(session, graph_def, opt_config, data_type, calib_file):
 
     remove_redundant_quants(session, session.graph.as_graph_def())
     remove_redundant_casts(session, session.graph.as_graph_def())
+    session.run(init_list)
 
     return update_dict
 
@@ -365,7 +380,7 @@ def update_embedding_vars(session):
     return update_dict
 
 
-def embedding_opt(session, graph_def, opt_config, data_type, variable_path):
+def embedding_opt(session, graph_def, opt_config, skip_list, data_type, variable_path):
     simple_graph = SimpleGraph(graph_def)
 
     def _get_gather_pattern():
@@ -381,44 +396,50 @@ def embedding_opt(session, graph_def, opt_config, data_type, variable_path):
     ptm_list = util.get_matched_pattern(simple_graph, pattern, first_key)
     if opt_config:
         ptm_list = [ptm for ptm in ptm_list if ptm['embed'] in opt_config]
+    if skip_list:
+        ptm_list = [ptm for ptm in ptm_list if ptm['embed'] not in skip_list]
     for ptm in ptm_list:
         embed_node = util.get_node_by_name(graph_def, simple_graph, ptm['embed'])
         opt_dtype = opt_config.get(embed_node.name) if opt_config else data_type
         if embed_node.name not in update_dict:
             print(f'Optimize embedding to {opt_dtype}: {embed_node.name}')
             # Add variables
-            fp32_data = util.get_const_value_by_name(
-                graph_def, ptm['embed'], simple_graph
-            )
-            if opt_dtype == INT8:
-                int8_name = f'{embed_node.name}/int8_data'
-                int8_var = tf.get_variable(int8_name, fp32_data.shape, tf.int8)
-                scale_name = f'{embed_node.name}/int8_scale'
-                scale_var = tf.get_variable(scale_name, int8_var.shape[-1:], tf.float32)
-                update_dict[embed_node.name] = [int8_var, scale_var, opt_dtype]
-            elif opt_dtype in [BF16, FP16]:
-                tf_dtype = tf.bfloat16 if opt_dtype == BF16 else tf.float16
-                f16_name = f'{embed_node.name}/{opt_dtype.lower()}_data'
-                f16_var = tf.get_variable(f16_name, fp32_data.shape, tf_dtype)
-                update_dict[embed_node.name] = [f16_var, opt_dtype]
-            else:
-                raise Exception(f'Unsupported data type: {opt_dtype}')
+            embed_op = session.graph.get_operation_by_name(embed_node.name)
+            with tf.device(embed_op.device):
+                fp32_data = util.get_const_value_by_name(
+                    graph_def, embed_node.name, simple_graph
+                )
+                if opt_dtype == INT8:
+                    int8_name = f'{embed_node.name}/int8_data'
+                    int8_var = tf.get_variable(int8_name, fp32_data.shape, tf.int8)
+                    scale_name = f'{embed_node.name}/int8_scale'
+                    scale_shape = int8_var.shape[-1:]
+                    scale_var = tf.get_variable(scale_name, scale_shape, tf.float32)
+                    update_dict[embed_node.name] = [int8_var, scale_var, opt_dtype]
+                elif opt_dtype in [BF16, FP16]:
+                    tf_dtype = tf.bfloat16 if opt_dtype == BF16 else tf.float16
+                    f16_name = f'{embed_node.name}/{opt_dtype.lower()}_data'
+                    f16_var = tf.get_variable(f16_name, fp32_data.shape, tf_dtype)
+                    update_dict[embed_node.name] = [f16_var, opt_dtype]
+                else:
+                    raise Exception(f'Unsupported data type: {opt_dtype}')
         # Update Graph
         gather_op = session.graph.get_operation_by_name(ptm['gather'])
-        opt_gather = tf.gather(
-            params=update_dict[embed_node.name][0],
-            indices=gather_op.inputs[1],
-            axis=gather_op.inputs[2],
-            batch_dims=gather_op.get_attr('batch_dims'),
-            name=f'{ptm["gather"]}/{opt_dtype.lower()}',
-        )
-        cast_name = f'{ptm["gather"]}/cast_to_fp32'
-        update_tensor = tf.cast(opt_gather, dtype=tf.float32, name=cast_name)
-        if opt_dtype == INT8:
-            rescale_name = f'{ptm["gather"]}/rescale'
-            scale_var = update_dict[embed_node.name][1]
-            update_tensor = tf.multiply(update_tensor, scale_var, name=rescale_name)
-        update_op_inputs(session.graph, {ptm['gather']: update_tensor})
+        with tf.device(gather_op.device):
+            opt_gather = tf.gather(
+                params=update_dict[embed_node.name][0],
+                indices=gather_op.inputs[1],
+                axis=gather_op.inputs[2],
+                batch_dims=gather_op.get_attr('batch_dims'),
+                name=f'{ptm["gather"]}/{opt_dtype.lower()}',
+            )
+            cast_name = f'{ptm["gather"]}/cast_to_fp32'
+            update_tensor = tf.cast(opt_gather, dtype=tf.float32, name=cast_name)
+            if opt_dtype == INT8:
+                rescale_name = f'{ptm["gather"]}/rescale'
+                scale_var = update_dict[embed_node.name][1]
+                update_tensor = tf.multiply(update_tensor, scale_var, name=rescale_name)
+            update_op_inputs(session.graph, {ptm['gather']: update_tensor})
 
     # Convert checkpoint
     for opt_dtype in [INT8, BF16, FP16]:
@@ -435,7 +456,9 @@ def embedding_opt(session, graph_def, opt_config, data_type, variable_path):
             tmp_path = tempfile.mkdtemp(dir='.')
             opt_path = f'{tmp_path}/variables'
             dtype = get_tf_dtype(opt_dtype)
-            import re; names = [k[:k.rfind('/')] if re.search('/part_[0-9]+$', k) else k for k in names]
+            # Rename for partitioned variable
+            re_pt = '/part_[0-9]+$'
+            names = [k[: k.rfind('/')] if re.search(re_pt, k) else k for k in names]
             quantize_embedding_variable.quantize_by_name(
                 variable_path, opt_path, names, quant_names, scale_names, dtype, False
             )
@@ -446,7 +469,9 @@ def embedding_opt(session, graph_def, opt_config, data_type, variable_path):
     return update_dict
 
 
-def embedding_var_opt(session, graph_def, opt_config, data_type, variable_path):
+def embedding_var_opt(
+    session, graph_def, opt_config, skip_list, data_type, variable_path
+):
     simple_graph = SimpleGraph(graph_def)
 
     def _get_gather_pattern():
@@ -461,6 +486,8 @@ def embedding_var_opt(session, graph_def, opt_config, data_type, variable_path):
     ptm_list = util.get_matched_pattern(simple_graph, pattern, first_key)
     if opt_config:
         ptm_list = [ptm for ptm in ptm_list if ptm['embed'] in opt_config]
+    if skip_list:
+        ptm_list = [ptm for ptm in ptm_list if ptm['embed'] not in skip_list]
     for ptm in ptm_list:
         embed_name = ptm['embed']
         opt_dtype = opt_config.get(embed_name) if opt_config else data_type
@@ -470,50 +497,53 @@ def embedding_var_opt(session, graph_def, opt_config, data_type, variable_path):
                 continue
             print(f'Optimize embedding variable to {opt_dtype}: {embed_name}')
             # Add variables
-            var = get_variable_by_name(_ts(embed_name))
-            embedding_dim = var.shape[0].value
-            value_dtype = get_tf_dtype(opt_dtype)
-            opt_var = tf.get_embedding_variable(
-                name=f'{embed_name}/{opt_dtype.lower()}_data',
-                embedding_dim=embedding_dim,
-                key_dtype=var._invalid_key_type,
-                value_dtype=value_dtype,
-                initializer=tf.zeros_initializer(value_dtype),
-            )
-            for attr in ev_attrs:
-                setattr(opt_var, attr, getattr(var, attr))
-            if opt_dtype == INT8:
-                scale_name = f'{embed_name}/int8_scale'
-                scale_var = tf.get_variable(scale_name, [embedding_dim], tf.float32)
-                update_dict[embed_name] = [opt_var, scale_var, opt_dtype]
-            elif opt_dtype in [BF16, FP16]:
-                update_dict[embed_name] = [opt_var, opt_dtype]
+            embed_op = session.graph.get_operation_by_name(embed_name)
+            with tf.device(embed_op.device):
+                var = get_variable_by_name(_ts(embed_name))
+                embedding_dim = var.shape[0].value
+                value_dtype = get_tf_dtype(opt_dtype)
+                opt_var = tf.get_embedding_variable(
+                    name=f'{embed_name}/{opt_dtype.lower()}_data',
+                    embedding_dim=embedding_dim,
+                    key_dtype=var._invalid_key_type,
+                    value_dtype=value_dtype,
+                    initializer=tf.zeros_initializer(value_dtype),
+                )
+                for attr in ev_attrs:
+                    setattr(opt_var, attr, getattr(var, attr))
+                if opt_dtype == INT8:
+                    scale_name = f'{embed_name}/int8_scale'
+                    scale_var = tf.get_variable(scale_name, [embedding_dim], tf.float32)
+                    update_dict[embed_name] = [opt_var, scale_var, opt_dtype]
+                elif opt_dtype in [BF16, FP16]:
+                    update_dict[embed_name] = [opt_var, opt_dtype]
 
         # Update Graph
         gather_op = session.graph.get_operation_by_name(ptm['gather'])
-        use_default = gather_op.get_attr('is_use_default_value_tensor')
-        if use_default:
-            init_val = gather_op.inputs[2]
+        with tf.device(gather_op.device):
+            use_default = gather_op.get_attr('is_use_default_value_tensor')
+            if use_default:
+                init_val = gather_op.inputs[2]
+                if opt_dtype == INT8:
+                    init_val = tf.divide(init_val, update_dict[embed_name][1])
+                    init_val = tf.raw_ops.ClipByValue(init_val, -128, 127)
+                init_val = tf.cast(init_val, value_dtype)
+            else:
+                init_val = tf.constant(1, dtype=value_dtype)
+            opt_gather = gen_kv_variable_ops.kv_resource_gather(
+                resource=update_dict[embed_name][0]._handle,
+                indices=gather_op.inputs[1],
+                default_value=init_val,
+                is_use_default_value_tensor=use_default,
+                name=f'{ptm["gather"]}/{opt_dtype.lower()}',
+            )
+            cast_name = f'{ptm["gather"]}/cast_to_fp32'
+            update_tensor = tf.cast(opt_gather, dtype=tf.float32, name=cast_name)
             if opt_dtype == INT8:
-                init_val = tf.divide(init_val, update_dict[embed_name][1])
-                init_val = tf.raw_ops.ClipByValue(init_val, -128, 127)
-            init_val = tf.cast(init_val, value_dtype)
-        else:
-            init_val = tf.constant(1, dtype=value_dtype)
-        opt_gather = gen_kv_variable_ops.kv_resource_gather(
-            resource=update_dict[embed_name][0]._handle,
-            indices=gather_op.inputs[1],
-            default_value=init_val,
-            is_use_default_value_tensor=use_default,
-            name=f'{ptm["gather"]}/{opt_dtype.lower()}',
-        )
-        cast_name = f'{ptm["gather"]}/cast_to_fp32'
-        update_tensor = tf.cast(opt_gather, dtype=tf.float32, name=cast_name)
-        if opt_dtype == INT8:
-            rescale_name = f'{ptm["gather"]}/rescale'
-            scale_var = update_dict[embed_name][1]
-            update_tensor = tf.multiply(update_tensor, scale_var, name=rescale_name)
-        update_op_inputs(session.graph, {ptm['gather']: update_tensor})
+                rescale_name = f'{ptm["gather"]}/rescale'
+                scale_var = update_dict[embed_name][1]
+                update_tensor = tf.multiply(update_tensor, scale_var, name=rescale_name)
+            update_op_inputs(session.graph, {ptm['gather']: update_tensor})
 
     if len(update_dict) == 0:
         return update_dict, None
@@ -543,7 +573,14 @@ def embedding_var_opt(session, graph_def, opt_config, data_type, variable_path):
     return update_dict, variable_path
 
 
-def optimize(model_path, save_path, opt_config=None, data_type=BF16, calib_file=None):
+def optimize(
+    model_path,
+    save_path,
+    opt_config=None,
+    skip_list=None,
+    data_type=BF16,
+    calib_file=None,
+):
     saved_model = loader_impl._parse_saved_model(model_path)
     tags = saved_model.meta_graphs[0].meta_info_def.tags
     with tf.Session() as sess:
@@ -559,10 +596,12 @@ def optimize(model_path, save_path, opt_config=None, data_type=BF16, calib_file=
         )
 
         # Embedding & Dense optimization
-        dense_opt_dict = dense_opt(sess, frozen_gdef, opt_config, data_type, calib_file)
+        dense_opt_dict = dense_opt(
+            sess, frozen_gdef, opt_config, skip_list, data_type, calib_file
+        )
         variable_path = f'{model_path}/variables/variables'
         embed_opt_dict = embedding_opt(
-            sess, frozen_gdef, opt_config, data_type, variable_path
+            sess, frozen_gdef, opt_config, skip_list, data_type, variable_path
         )
         ev_dict = update_embedding_vars(sess)
         if len(ev_dict) > 0:
@@ -588,7 +627,7 @@ def optimize(model_path, save_path, opt_config=None, data_type=BF16, calib_file=
         saver, init_name = _save(variable_path)
         # Optimize embedding variables
         ev_opt_dict, opt_variable_path = embedding_var_opt(
-            sess, frozen_gdef, opt_config, data_type, variable_path
+            sess, frozen_gdef, opt_config, skip_list, data_type, variable_path
         )
         if len(ev_opt_dict) > 0:
             saver, init_name = _save(variable_path)
@@ -750,4 +789,5 @@ if __name__ == '__main__':
     data_type = sys.argv[3]
     calib_file = sys.argv[4] if len(sys.argv) > 4 else None
     opt_dict = None
-    optimize(model_path, save_path, opt_dict, data_type, calib_file)
+    skip_list = None
+    optimize(model_path, save_path, opt_dict, skip_list, data_type, calib_file)
